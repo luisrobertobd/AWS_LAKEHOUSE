@@ -1,0 +1,68 @@
+Job: JOB_SILVER_VENTAS
+
+Objetivo: Implementar un proceso ETL que permita leer los datos de ventas almacenados en la capa Bronze, aplicar reglas de transformación y calidad de datos, y realizar una carga incremental sobre una tabla Apache Iceberg, evitando la duplicidad de registros durante los reprocesamientos.
+
+El proceso se divide en ocho etapas, considerando que la creación de la tabla Iceberg se realiza de manera independiente mediante el JOB_INIT_SILVER_VENTAS.
+Paso 1. Recepción de parámetros de ejecución
+Se reciben los parámetros de ejecución mediante la función getResolvedOptions de AWS Glue.
+
+El parámetro FECHA_PROCESO determina la fecha de los datos que serán procesados y permite ejecutar el mismo job para diferentes fechas sin modificar el código fuente.
+
+Adicionalmente, se valida que la fecha recibida cumpla con el formato YYYY-MM-DD.
+
+Esta parametrización facilita la automatización, la orquestación y el reprocesamiento de fechas históricas.
+Paso 2. Lectura de datos de la capa Bronze
+Se construye dinámicamente la ruta de origen en Amazon S3 utilizando la fecha recibida como parámetro.
+s3://lablake/bronze/ventas/fecha_carga=YYYY-MM-DD/
+
+
+Los archivos Parquet correspondientes a la fecha solicitada son leídos mediante Apache Spark y almacenados en un DataFrame denominado df_bronze.
+
+Se registra en el log la cantidad de registros leídos para facilitar el seguimiento y la auditoría del proceso.
+Paso 3. Transformación y estandarización de datos
+Se realizan las conversiones de tipos de datos necesarias para garantizar la compatibilidad con el esquema definido en la tabla Silver.
+
+Se utiliza la función try_cast, que permite identificar valores que no pueden convertirse al tipo de dato esperado, retornando NULL en lugar de generar un error de conversión.
+
+Adicionalmente, se incorporan campos de trazabilidad:
+- fecha_procesamiento: fecha y hora de ejecución del proceso.
+- archivo_origen: identificación del archivo del cual proviene el registro.
+- fecha_carga: fecha lógica de procesamiento recibida como parámetro.
+El resultado de esta etapa se almacena en el DataFrame df_silver.
+Paso 4. Aplicación de reglas de calidad de datos
+Se aplican reglas de validación para garantizar que los registros cumplan con las condiciones mínimas de calidad antes de ser incorporados a la capa Silver.
+Campo	Regla de validación
+id_venta	No puede ser nulo.
+fecha_venta	Debe contener una fecha válida.
+id_cliente	No puede ser nulo.
+id_producto	No puede ser nulo.
+cantidad	Debe ser mayor que cero.
+precio_unitario	Debe ser mayor o igual a cero.
+importe_venta	No puede ser nulo.
+
+Como resultado, se generan dos DataFrames:
+- df_validos: registros que cumplen las reglas de calidad.
+- df_rechazados: registros que incumplen alguna de las reglas.
+Se registra la cantidad de registros válidos y rechazados en los logs de ejecución.
+
+En esta versión del laboratorio, los registros rechazados se contabilizan, pero todavía no se almacenan de manera persistente.
+Paso 5. Validación de registros duplicados
+Se verifica la unicidad del campo id_venta, definido como clave de negocio para este ejercicio.
+
+Mediante una operación de agrupación y conteo, se identifican aquellos identificadores de venta que aparecen más de una vez dentro del conjunto de registros válidos.
+
+Si se detectan duplicados, el proceso genera una excepción y finaliza su ejecución antes de realizar la carga.
+
+Este control protege la integridad de los datos y evita conflictos durante la operación MERGE INTO.
+Paso 6. Creación de una vista temporal
+Se registra el DataFrame que contiene los registros válidos como una vista temporal de Spark denominada tmp_ventas.
+df_validos.createOrReplaceTempView("tmp_ventas")
+
+
+
+Esta vista permite consultar los datos mediante Spark SQL y utilizarlos como origen de la operación de carga hacia la tabla Iceberg.
+
+La vista existe únicamente durante la sesión de Spark y no genera almacenamiento físico adicional en Amazon S3.
+Paso 7. Carga incremental mediante MERGE INTO
+Se realiza la carga de los registros válidos sobre la tabla Apache Iceberg:
+glue_catalog.db_lake_ventas.silver_ventas
